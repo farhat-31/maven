@@ -6,6 +6,13 @@ on:
   #     - main
   workflow_dispatch:
 
+env:
+  APP_DIR: /home/ec2-user/app
+  REPO_NAME: maven
+  REPO_URL: https://github.com/${{ github.repository }}.git
+  JAR_NAME: datastore-0.0.7.jar
+  APP_PORT: "8084"
+
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
@@ -20,7 +27,7 @@ jobs:
           distribution: temurin
           java-version: 17
           cache: maven
-      
+
       - name: Build and SonarQube Scan
         working-directory: backend
         env:
@@ -33,7 +40,7 @@ jobs:
             -Dsonar.projectName=backend \
             -Dsonar.host.url=$SONAR_HOST_URL \
             -Dsonar.token=$SONAR_TOKEN
-      
+
       - name: SonarQube Quality Gate
         uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
         with:
@@ -58,20 +65,17 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
+          envs: APP_DIR,REPO_NAME,REPO_URL
           script: |
             set -e
-            APP_DIR=/home/ec2-user/app
-            REPO_NAME=Java-springboot-project
-            REPO_URL=https://github.com/CloudTechDevOps/Java-springboot-project.git
-            mkdir -p $APP_DIR
-            cd $APP_DIR
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
             if [ -d "$REPO_NAME/.git" ]; then
-              cd $REPO_NAME
-              git reset --hard
-              git pull origin main
+              cd "$REPO_NAME"
+              git fetch origin main
+              git reset --hard origin/main
             else
-              git clone $REPO_URL
-              cd $REPO_NAME
+              git clone "$REPO_URL" "$REPO_NAME"
             fi
 
       - name: Build Maven Application
@@ -80,8 +84,10 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
+          envs: APP_DIR,REPO_NAME
           script: |
-            cd /home/ec2-user/app/Java-springboot-project/backend
+            set -e
+            cd "$APP_DIR/$REPO_NAME/backend"
             mvn clean package -DskipTests -U
 
       - name: Stop Old Application
@@ -90,53 +96,54 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
+          envs: JAR_NAME
           script_stop: false
           script: |
-            PID=$(ps -ef | grep '[d]atastore-0.0.7.jar' | awk '{print $2}')
-      
+            PID=$(ps -ef | grep "[d]atastore-.*\.jar" | awk '{print $2}')
+
             if [ -z "$PID" ]; then
               echo "Application is not running."
               exit 0
             fi
-      
+
             echo "Stopping PID: $PID"
             kill -15 $PID
             sleep 5
-      
+
             if ps -p $PID > /dev/null 2>&1; then
               echo "Force killing PID: $PID"
               kill -9 $PID
             fi
-      
+
             echo "Application stopped."
 
       - name: Start Application
         uses: appleboy/ssh-action@v1.1.0
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
+          envs: APP_DIR,REPO_NAME,JAR_NAME,APP_PORT,DB_HOST,DB_USERNAME,DB_PASSWORD
           script: |
             LOG_DIR=/var/log/app
-            sudo mkdir -p $LOG_DIR
-            sudo chown ec2-user:ec2-user $LOG_DIR
-            cd /home/ec2-user/app/Java-springboot-project/backend/target
-            nohup env \
-              MYSQL_HOST=${{ secrets.DB_HOST }} \
-              MYSQL_PORT=3306 \
-              MYSQL_USERNAME=${{ secrets.DB_USERNAME }} \
-              MYSQL_PASSWORD=${{ secrets.DB_PASSWORD }} \
-              LOG_FILE_PATH=$LOG_DIR/datastore.log \
-              java -jar datastore-0.0.7.jar --server.port=8084 \
-              > $LOG_DIR/nohup.out 2>&1 &
+            sudo mkdir -p "$LOG_DIR"
+            sudo chown ec2-user:ec2-user "$LOG_DIR"
+            cd "$APP_DIR/$REPO_NAME/backend/target"
 
-      - name: Wait for App Startup
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: sleep 15
+            # DB_HOST must be a bare hostname (no "jdbc:" prefix, no port)
+            MYSQL_HOST="$DB_HOST" \
+            MYSQL_PORT=3306 \
+            MYSQL_USERNAME="$DB_USERNAME" \
+            MYSQL_PASSWORD="$DB_PASSWORD" \
+            LOG_FILE_PATH="$LOG_DIR/datastore.log" \
+            setsid nohup java -jar "$JAR_NAME" --server.port="$APP_PORT" \
+              > "$LOG_DIR/nohup.out" 2>&1 < /dev/null &
+
+            echo "Application launched."
 
       - name: Verify Application
         uses: appleboy/ssh-action@v1.1.0
@@ -144,29 +151,18 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
+          envs: APP_PORT
           script: |
-            HEALTH=$(curl -s http://localhost:8084/actuator/health)
-            echo "$HEALTH"
-            [[ "$HEALTH" == *'"status":"UP"'* ]]
+            for i in $(seq 1 12); do
+              HEALTH=$(curl -s "http://localhost:$APP_PORT/actuator/health" || true)
+              echo "Attempt $i/12: $HEALTH"
+              if echo "$HEALTH" | grep -q '^{"status":"UP"'; then
+                echo "Application is healthy."
+                exit 0
+              fi
+              sleep 5
+            done
 
-      - name: Send Deployment Report
-        if: always()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: Backend Deployment Report - ${{ github.repository }}
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_USERNAME }}
-          body: |
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Status: ${{ job.status }}
-            Actor: ${{ github.actor }}
-            Workflow: ${{ github.workflow }}
-            SonarQube: Completed
-            Quality Gate: Passed if workflow succeeded.
+            echo "Application did not become healthy. Last 50 lines of nohup.out:"
+            tail -n 50 /var/log/app/nohup.out
+            exit 1
