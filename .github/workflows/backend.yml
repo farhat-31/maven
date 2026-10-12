@@ -5,6 +5,11 @@ on:
   #   branches:
   #     - main
   workflow_dispatch:
+    inputs:
+      reset_db_password:
+        description: "Reset the RDS master password to a new random one before deploying"
+        type: boolean
+        default: false
 
 env:
   APP_DIR: /home/ec2-user/app
@@ -12,6 +17,8 @@ env:
   REPO_URL: https://github.com/${{ github.repository }}.git
   JAR_NAME: datastore-0.0.7.jar
   APP_PORT: "8084"
+  AWS_REGION: us-east-1
+  SSM_PARAM: /datastore/db_password
 
 jobs:
   build-deploy:
@@ -48,6 +55,74 @@ jobs:
         timeout-minutes: 10
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      ######################################################
+      # DB password: optional reset + automatic load
+      ######################################################
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reset RDS master password
+        if: ${{ inputs.reset_db_password }}
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+        run: |
+          set -euo pipefail
+
+          # The first label of an RDS endpoint is the DB instance identifier
+          DB_INSTANCE_ID="${DB_HOST%%.*}"
+          echo "Resetting master password for RDS instance: $DB_INSTANCE_ID"
+
+          # Alphanumeric only, so it is safe in shells, JDBC and RDS rules
+          NEW_PASSWORD="$(openssl rand -hex 20)"
+          echo "::add-mask::$NEW_PASSWORD"
+
+          aws rds modify-db-instance \
+            --db-instance-identifier "$DB_INSTANCE_ID" \
+            --master-user-password "$NEW_PASSWORD" \
+            --apply-immediately > /dev/null
+
+          # Save right away so the new password is never lost
+          aws ssm put-parameter \
+            --name "$SSM_PARAM" \
+            --type SecureString \
+            --value "$NEW_PASSWORD" \
+            --overwrite > /dev/null
+
+          sleep 30
+          aws rds wait db-instance-available --db-instance-identifier "$DB_INSTANCE_ID"
+          echo "Password reset and saved to SSM parameter $SSM_PARAM"
+
+      - name: Load DB password
+        env:
+          FALLBACK_DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -uo pipefail
+
+          PW="$(aws ssm get-parameter \
+            --name "$SSM_PARAM" \
+            --with-decryption \
+            --query Parameter.Value \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$PW" ]; then
+            echo "No password in SSM yet; falling back to the DB_PASSWORD secret"
+            PW="$FALLBACK_DB_PASSWORD"
+          else
+            echo "Loaded DB password from SSM parameter $SSM_PARAM"
+          fi
+
+          echo "::add-mask::$PW"
+          echo "DB_PASSWORD=$PW" >> "$GITHUB_ENV"
+
+      ######################################################
+      # Deploy
+      ######################################################
 
       - name: Prepare EC2
         uses: appleboy/ssh-action@v1.1.0
@@ -123,7 +198,7 @@ jobs:
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          # DB_PASSWORD comes from the "Load DB password" step (GITHUB_ENV)
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
