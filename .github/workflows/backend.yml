@@ -96,10 +96,11 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_KEY }}
-          envs: JAR_NAME
           script_stop: false
           script: |
-            PID=$(ps -ef | grep "[d]atastore-.*\.jar" | awk '{print $2}')
+            # Match only the java process; the [j] trick stops this script's own
+            # command line from matching, and $$ is excluded as a second safeguard.
+            PID=$(pgrep -f '[j]ava .*datastore-.*\.jar' | grep -vx "$$" || true)
 
             if [ -z "$PID" ]; then
               echo "Application is not running."
